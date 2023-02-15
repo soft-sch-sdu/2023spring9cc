@@ -1,0 +1,1 @@
+int main(){ float a[3] = {2.3, 2.2, 3.7}; int i; for (i=0; i<3; i=i+1) {print(a[i]); print(i);} }
