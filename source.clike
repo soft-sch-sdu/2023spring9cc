@@ -1,1 +1,11 @@
-int main(){ float a[3] = {2.3, 2.2, 3.7}; int i; for (i=0; i<3; i=i+1) {print(a[i]); print(i);} }
+            case '*':
+                printf("  mov %s, %%rax\n", regs[ir->rhs]);
+                printf("  mul %s\n", regs[ir->lhs]);
+                printf("  mov %%rax, %s\n", regs[ir->lhs]);
+                break;
+            case '/':
+                printf("  mov %s, %%rax\n", regs[ir->lhs]);
+                printf("  cqo\n");
+                printf("  div %s\n", regs[ir->rhs]);
+                printf("  mov %%rax, %s\n", regs[ir->lhs]);
+                break;

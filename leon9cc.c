@@ -65,8 +65,8 @@ Vector *tokenize(char *p) {
             continue;
         }
 
-        // + or -
-        if (*p == '+' || *p == '-') {
+        // Single-letter token
+        if (strchr("+-*/", *p)) {
             add_token(v, *p, p);
             i++;
             p++;
@@ -90,6 +90,14 @@ Vector *tokenize(char *p) {
 }
 
 // Recursive-descendent parser
+
+void error(char *fmt, ...) { // An error reporting function.
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "\n");
+    exit(1);
+}
 
 enum {
     ND_NUM = 256,     // Number literal
@@ -120,15 +128,7 @@ Node *new_node_num(int val) {
     return node;
 }
 
-void error(char *fmt, ...) { // An error reporting function.
-    va_list ap;
-    va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    fprintf(stderr, "\n");
-    exit(1);
-}
-
-Node *number() {
+static Node *number() {
     Token *t = tokens->data[pos];
     if (t->ty != TK_NUM)
         error("number expected, but got %s", t->input);
@@ -136,22 +136,40 @@ Node *number() {
     return new_node_num(t->val);
 }
 
-Node *expr() {
+static Node *mul() {
     Node *lhs = number();
     for (;;) {
         Token *t = tokens->data[pos];
         int op = t->ty;
-        if (op != '+' && op != '-')
-            break;
+        if (op != '*' && op != '/')
+            return lhs;
         pos++;
         lhs = new_node(op, lhs, number());
     }
+}
+
+static Node *expr() {
+    Node *lhs = mul();
+    for (;;) {
+        Token *t = tokens->data[pos];
+        int op = t->ty;
+        if (op != '+' && op != '-')
+            return lhs;
+        pos++;
+        lhs = new_node(op, lhs, mul());
+    }
+}
+
+Node *parse(Vector *v) {
+    tokens = v;
+    pos = 0;
+
+    Node *node = expr();
 
     Token *t = tokens->data[pos];
-    if (t->ty != TK_EOF)         // 检查是否正确结束
+    if (t->ty != TK_EOF)
         error("stray token: %s", t->input);
-
-    return lhs;
+    return node;
 }
 
 // Intermediate representation
@@ -188,10 +206,10 @@ int gen_ir_sub(Vector *v, Node *node) {
         return registerNo;
     }
 
-    assert(node->ty == '+' || node->ty == '-');
+    assert(strchr("+-*/", node->ty));
     // 不管当前AST结点是+还是-，先左分支后右分支，分别生成TAC指令，并分别将result地址存于lhs和rhs.
     // 从这里也可以看出，lhs与rhs都是代表地址，即寄存器编号.
-    // 注意，这里每条TAC指令都分配一个新的寄存器，用来保存该指令的结果.
+    // 注意，这里每条TAC指令都分配一个新的寄存器(无限多个，足够用)，用来保存该指令的结果.
     int lhs = gen_ir_sub(v, node->lhs);
     int rhs = gen_ir_sub(v, node->rhs);
 
@@ -255,6 +273,8 @@ void alloc_regs(Vector *irv) {
             case IR_MOV:
             case '+':
             case '-':
+            case '*':
+            case '/':
                 ir->lhs = alloc(ir->lhs);
                 ir->rhs = alloc(ir->rhs);
                 break;
@@ -295,6 +315,15 @@ void gen_x86(Vector *irv) {
             case '-':
                 printf("  sub %s, %s\n", regs[ir->rhs], regs[ir->lhs]);
                 break;
+            case '*':
+                printf("  imul %s, %s\n", regs[ir->rhs], regs[ir->lhs]);
+                break;
+            case '/':
+                printf("  mov %s, %%rax\n", regs[ir->lhs]);
+                printf("  cqo\n");
+                printf("  div %s\n", regs[ir->rhs]);
+                printf("  mov %%rax, %s\n", regs[ir->lhs]);
+                break;
             case IR_NOP:
                 break;
             default:
@@ -314,7 +343,7 @@ int main(int argc, char **argv) {
 
     // Tokenize and parse.
     tokens = tokenize(argv[1]);
-    Node* node = expr();
+    Node* node = parse(tokens);
 
     Vector *irv = gen_ir(node);
     alloc_regs(irv);
