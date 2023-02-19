@@ -6,6 +6,30 @@
 #include <string.h>
 #include <stdbool.h>
 
+
+// Vector
+typedef struct {
+    void **data; // 也可以这么理解：void *([] data)
+    int capacity;
+    int len;
+} Vector;
+
+Vector *new_vec() { //token用到、IR用到
+    Vector *v = malloc(sizeof(Vector));
+    v->data = malloc(sizeof(void *) * 16);
+    v->capacity = 16;
+    v->len = 0;
+    return v; //v->{ data->[*. *. *. ... *], 16(初始空间可容16个*.), 0(开始时啥也没有) }
+}
+
+void vec_push(Vector *v, void *elem) {
+    if (v->len == v->capacity) {
+        v->capacity *= 2;
+        v->data = realloc(v->data, sizeof(void *) * v->capacity);
+    }
+    v->data[v->len++] = elem;
+}
+
 // Tokenizer
 
 enum {
@@ -20,10 +44,19 @@ typedef struct {
     char *input; // Token string (for error reporting)
 } Token;
 
-// Tokenized input is stored to this array.
-Token tokens[100];
+Token *add_token(Vector *v, int ty, char *input) {
+    Token *t = malloc(sizeof(Token));
+    t->ty = ty;
+    t->input = input;
+    vec_push(v, t);
+    return t;
+}
 
-void tokenize(char *p) {
+
+Vector *tokenize(char *p) {
+    // Tokenized input is stored to this array.
+    Vector *v = new_vec();   // 即后面的全局变量tokens
+
     int i = 0;
     while (*p) {
         // Skip whitespace
@@ -34,8 +67,7 @@ void tokenize(char *p) {
 
         // + or -
         if (*p == '+' || *p == '-') {
-            tokens[i].ty = *p;
-            tokens[i].input = p;
+            add_token(v, *p, p);
             i++;
             p++;
             continue;
@@ -43,9 +75,8 @@ void tokenize(char *p) {
 
         // Number
         if (isdigit(*p)) {
-            tokens[i].ty = TK_NUM;
-            tokens[i].input = p;
-            tokens[i].val = strtol(p, &p, 10);
+            Token *t = add_token(v, TK_NUM, p);
+            t->val = strtol(p, &p, 10);
             i++;
             continue;
         }
@@ -54,12 +85,11 @@ void tokenize(char *p) {
         exit(1);
     }
 
-    tokens[i].ty = TK_EOF;
+    add_token(v, TK_EOF, p);
+    return v;
 }
 
 // Recursive-descendent parser
-
-int pos = 0;
 
 enum {
     ND_NUM = 256,     // Number literal
@@ -71,6 +101,9 @@ typedef struct Node {
     struct Node *rhs; // right-hand side
     int val;          // Number literal
 } Node;
+
+Vector *tokens;
+int pos;
 
 Node *new_node(int op, Node *lhs, Node *rhs) {
     Node *node = malloc(sizeof(Node));
@@ -96,23 +129,28 @@ void error(char *fmt, ...) { // An error reporting function.
 }
 
 Node *number() {
-    if (tokens[pos].ty == TK_NUM)
-        return new_node_num(tokens[pos++].val);
-    error("number expected, but got %s", tokens[pos].input);
+    Token *t = tokens->data[pos];
+    if (t->ty != TK_NUM)
+        error("number expected, but got %s", t->input);
+    pos++;
+    return new_node_num(t->val);
 }
 
 Node *expr() {
     Node *lhs = number();
     for (;;) {
-        int op = tokens[pos].ty;
+        Token *t = tokens->data[pos];
+        int op = t->ty;
         if (op != '+' && op != '-')
             break;
         pos++;
         lhs = new_node(op, lhs, number());
     }
 
-    if (tokens[pos].ty != TK_EOF)
-        error("stray token: %s", tokens[pos].input);
+    Token *t = tokens->data[pos];
+    if (t->ty != TK_EOF)         // 检查是否正确结束
+        error("stray token: %s", t->input);
+
     return lhs;
 }
 
@@ -139,16 +177,14 @@ IR *new_ir(int op, int lhs, int rhs) {
     return ir;
 }
 
-IR *instructions[1000];
-int inp;
-int regno;
-
 // ir_sub的意思是IR subclass
-int gen_ir_sub(Node *node) {
+int gen_ir_sub(Vector *v, Node *node) {
+    static int regno;
+
     if (node->ty == ND_NUM) {
         int registerNo = regno++;
         // instructions[指令(执行时的)序列号] = new_ir(指令类型，地址(寄存器编号)，值)
-        instructions[inp++] = new_ir(IR_IMM, registerNo, node->val);
+        vec_push(v, new_ir(IR_IMM, registerNo, node->val));
         return registerNo;
     }
 
@@ -156,20 +192,22 @@ int gen_ir_sub(Node *node) {
     // 不管当前AST结点是+还是-，先左分支后右分支，分别生成TAC指令，并分别将result地址存于lhs和rhs.
     // 从这里也可以看出，lhs与rhs都是代表地址，即寄存器编号.
     // 注意，这里每条TAC指令都分配一个新的寄存器，用来保存该指令的结果.
-    int lhs = gen_ir_sub(node->lhs);
-    int rhs = gen_ir_sub(node->rhs);
+    int lhs = gen_ir_sub(v, node->lhs);
+    int rhs = gen_ir_sub(v, node->rhs);
 
     // 根据左右结果，生成当前+或-对应的TAC指令，将指令添加到指令序列末尾，那么将来结果放到哪个寄存器？继续往下看...
-    instructions[inp++] = new_ir(node->ty, lhs, rhs);
+    vec_push(v, new_ir(node->ty, lhs, rhs));
     // 生成特殊指令KILL，将右结果(操作数)占用的寄存器释放
-    instructions[inp++] = new_ir(IR_KILL, rhs, 0); // 准备好，将来执行TAC指令序列时，把右操作数占用的寄存器还回去
+    vec_push(v, new_ir(IR_KILL, rhs, 0)); // 准备好，将来执行TAC指令序列时，把右操作数占用的寄存器还回去
     // 而将来的结果则放在左操作数之前占用的寄存器
     return lhs;
 }
 
-void gen_ir(Node *node) {
-    int registerNo = gen_ir_sub(node);
-    instructions[inp++] = new_ir(IR_RETURN, registerNo, 0);
+Vector *gen_ir(Node *node) {
+    Vector *instructions = new_vec();
+    int r = gen_ir_sub(instructions, node);
+    vec_push(instructions, new_ir(IR_RETURN, r, 0));
+    return instructions;
 }
 
 // Register allocator
@@ -177,7 +215,7 @@ void gen_ir(Node *node) {
 char *regs[] = {"%rdi", "%rsi", "%r10", "%r11", "%r12", "%r13", "%r14", "%r15"};
 bool used[8];
 
-int reg_map[1000];
+int *reg_map;
 
 int alloc(int ir_reg) {
     if (reg_map[ir_reg] != -1) {
@@ -193,6 +231,7 @@ int alloc(int ir_reg) {
         reg_map[ir_reg] = i;
         return i;
     }
+
     error("register exhausted");
 }
 
@@ -201,9 +240,13 @@ void kill(int registerNo) {
     used[registerNo] = false;
 }
 
-void alloc_regs() {
-    for (int i = 0; i < inp; i++) {
-        IR *ir = instructions[i];
+void alloc_regs(Vector *irv) {
+    reg_map = malloc(sizeof(int) * irv->len);
+    for (int i = 0; i < irv->len; i++)
+        reg_map[i] = -1;
+
+    for (int i = 0; i < irv->len; i++) {
+        IR *ir = irv->data[i];
 
         switch (ir->op) {
             case IR_IMM:
@@ -231,9 +274,9 @@ void alloc_regs() {
 
 // Code generator
 
-void gen_x86() {
-    for (int i = 0; i < inp; i++) {
-        IR *ir = instructions[i];
+void gen_x86(Vector *irv) {
+    for (int i = 0; i < irv->len; i++) {
+        IR *ir = irv->data[i];
 
         switch (ir->op) {
             case IR_IMM:
@@ -269,21 +312,17 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-
-    for (int i = 0; i < sizeof(reg_map) / sizeof(*reg_map); i++)
-        reg_map[i] = -1;
-
     // Tokenize and parse.
-    tokenize(argv[1]);
+    tokens = tokenize(argv[1]);
     Node* node = expr();
 
-    gen_ir(node);
-    alloc_regs();
+    Vector *irv = gen_ir(node);
+    alloc_regs(irv);
 
     printf("  .global main\n");
     printf("main:\n");
 
-    gen_x86();
+    gen_x86(irv);
 
     return 0;
 }
