@@ -24,7 +24,7 @@ Vector *new_vec() {
 }
 
 void vec_push(Vector *v, void *elem) {
-    if (v->len == v->capacity) {
+    if (v->len == v->capacity) { // 空间已满，则增加为原来的2倍
         v->capacity *= 2;
         v->data = realloc(v->data, sizeof(void *) * v->capacity);
     }
@@ -56,6 +56,12 @@ void *map_get(Map *map, char *key) {
     return NULL;
 }
 
+bool map_exists(Map *map, char *key) {
+    for (int i = 0; i < map->keys->len; i++)
+        if (!strcmp(map->keys->data[i], key))
+            return true;
+    return false;
+}
 
 // An error reporting function.
 void error(char *fmt, ...) {
@@ -66,13 +72,12 @@ void error(char *fmt, ...) {
     exit(1);
 }
 
-
-// Tokenizer
-
+//// Tokenizer
 Map *keywords;
 
 enum {
     TK_NUM = 256, // Number literal
+    TK_IDENT,     // Identifier
     TK_RETURN,    // "return"
     TK_EOF,       // End marker
 };
@@ -80,6 +85,7 @@ enum {
 typedef struct {
     int ty;      // Token type
     int val;     // Number literal
+    char *name;  // Identifier
     char *input; // Token string (for error reporting)
 } Token;
 
@@ -104,14 +110,14 @@ static Vector *scan(char *p) {
         }
 
         // Single-letter token
-        if (strchr("+-*/;", *p)) {
+        if (strchr("+-*/;=", *p)) {
             add_token(v, *p, p);
             i++;
             p++;
             continue;
         }
 
-        // Keyword
+        // Identifier
         if (isalpha(*p) || *p == '_') {
             int len = 1;
             while (isalpha(p[len]) || isdigit(p[len]) || p[len] == '_')
@@ -120,9 +126,10 @@ static Vector *scan(char *p) {
             char *name = strndup(p, len);
             int ty = (intptr_t)map_get(keywords, name);
             if (!ty)
-                error("unknown identifier: %s", name);
+                ty = TK_IDENT;
 
-            add_token(v, ty, p);
+            Token *t = add_token(v, ty, p);
+            t->name = name;
             i++;
             p += len;
             continue;
@@ -150,9 +157,10 @@ Vector *tokenize(char *p) {
     return scan(p);
 }
 
-// Recursive-descendent parser
+//// Recursive-descendent parser
 enum {
     ND_NUM = 256,     // Number literal
+    ND_IDENT,         // Identifier
     ND_RETURN,        // Return statement
     ND_COMP_STMT,     // Compound statement
     ND_EXPR_STMT,     // Expressions tatement
@@ -163,12 +171,22 @@ typedef struct Node {
     struct Node *lhs;  // left-hand side
     struct Node *rhs;  // right-hand side
     int val;           // Number literal
-    struct Node *expr; // "return" or expresson stmt
+    char *name;        // Identifier
+    struct Node *expr; // "return" or expression stmt
     Vector *stmts;     // Compound statement
 } Node;
 
 static Vector *tokens;
 static int pos;
+
+// consume可视为与下面的expect配对使用，比如consume一个“(”，则expect一个“)”
+static bool consume(int ty) {
+    Token *t = tokens->data[pos];
+    if (t->ty != ty)
+        return false;
+    pos++;
+    return true;
+}
 
 static void expect(int ty) {
     Token *t = tokens->data[pos];
@@ -185,30 +203,41 @@ static Node *new_node(int op, Node *lhs, Node *rhs) {
     return node;
 }
 
-static Node *number() {
-    Token *t = tokens->data[pos];
-    if (t->ty != TK_NUM)
-        error("number expected, but got %s", t->input);
-    pos++;
-
+// term := num_literal | ident
+static Node *term() {
     Node *node = malloc(sizeof(Node));
-    node->ty = ND_NUM;
-    node->val = t->val;
-    return node;
+    Token *t = tokens->data[pos++];
+
+    if (t->ty == TK_NUM) {
+        node->ty = ND_NUM;
+        node->val = t->val;
+        return node;
+    }
+
+    if (t->ty == TK_IDENT) {
+        node->ty = ND_IDENT;
+        node->name = t->name;
+        return node;
+    }
+
+    error("number or variable expected, but got %s", t->input);
 }
 
+
+// mul_div :=  term ("*" term | "/" term)*
 static Node *mul() {
-    Node *lhs = number();
+    Node *lhs = term();
     for (;;) {
         Token *t = tokens->data[pos];
         int op = t->ty;
         if (op != '*' && op != '/')
             return lhs;
         pos++;
-        lhs = new_node(op, lhs, number());
+        lhs = new_node(op, lhs, term());
     }
 }
 
+// expr = mul_div ("+" mul_div | "-" mul_div)*
 static Node *expr() {
     Node *lhs = mul();
     for (;;) {
@@ -221,6 +250,15 @@ static Node *expr() {
     }
 }
 
+// assign :=  expr ("=" expr)?
+static Node *assign() {
+    Node *lhs = expr();
+    if (consume('='))
+        return new_node('=', lhs, expr());
+    return lhs;
+}
+
+// stmt :=  (expr_stmt | return_stmt)+
 static Node *stmt() {
     Node *node = malloc(sizeof(Node));
     node->ty = ND_COMP_STMT;
@@ -236,10 +274,10 @@ static Node *stmt() {
         if (t->ty == TK_RETURN) {
             pos++;
             e->ty = ND_RETURN;
-            e->expr = expr();
+            e->expr = assign();
         } else {
             e->ty = ND_EXPR_STMT;
-            e->expr = expr();
+            e->expr = assign();
         }
 
         vec_push(node->stmts, e);
@@ -249,9 +287,13 @@ static Node *stmt() {
 /******************CFG (or BNF)**************************
  *
  * program :=  stmt
- * stmt :=  (expr; | "return" expr;)+
- * expr :=  mul_div ("+" mul_div | "-" mul_div)*
- * mul_div :=  num_literal ("*" num_literal | "/" num_literal)*
+ * stmt :=  (expr_stmt | return_stmt)+
+ * return_stmt := "return" assign ";"
+ * expr_stmt := assign ";"
+ * assign :=  expr ("=" expr)?
+ * expr = mul_div ("+" mul_div | "-" mul_div)*
+ * mul_div :=  term ("*" term | "/" term)*
+ * term := num_literal | ident
  *
  *********************************************************/
 Node *parse(Vector *v) {
@@ -261,13 +303,16 @@ Node *parse(Vector *v) {
     return stmt();
 }
 
-// Intermediate representation
+//// Intermediate representation
 enum { // TAC的指令类型，这里并没全部枚举出来，比如“+”和“-”的类型值是其ASCII码值
-    IR_IMM,
-    IR_MOV,
-    IR_RETURN,
-    IR_KILL,
-    IR_NOP,
+    IR_IMM,                 // 赋值
+    IR_MOV,                 // 拷贝
+    IR_RETURN,              // 返回
+    IR_ALLOCA,
+    IR_LOAD,
+    IR_STORE,
+    IR_KILL,                // 退回某个存储地址（或者更直接的说，某个寄存器）
+    IR_NOP,                 // 啥也不做
 };
 
 typedef struct {
@@ -277,6 +322,11 @@ typedef struct {
 } IR;
 
 static Vector *code;
+static int regno;
+static int basereg;
+
+static Map *vars;
+static int bpoff;
 
 IR *add(int op, int lhs, int rhs) {
     IR *ir = malloc(sizeof(IR));
@@ -287,13 +337,46 @@ IR *add(int op, int lhs, int rhs) {
     return ir;
 }
 
+static int gen_lval(Node *node) {
+    if (node->ty != ND_IDENT)
+        error("not an lvalue");
+    // 若是新变量，则栈顶指针移动，腾出8个字节的空间
+    if (!map_exists(vars, node->name)) {
+        map_put(vars, node->name, (void *)(intptr_t)bpoff);
+        bpoff += 8;
+    }
+    // 针对该变量（不管新旧）：
+    int r1 = regno++;    // 准备空间r1，用于存储basereg的值
+    int off = (intptr_t)map_get(vars, node->name); // 获取该变量的偏移量
+    add(IR_MOV, r1, basereg); // 将basereg的值拷贝到r1
+
+    int r2 = regno++;      // 准备空间r2，用于存储偏移量off
+    add(IR_IMM, r2, off);  // 将偏移量off赋给r2
+    add('+', r1, r2);      // basereg + off
+    add(IR_KILL, r2, -1);  // 清空r2
+    return r1;             // 返回变量的存储地址
+}
+
 int gen_expr(Node *node) {
-    static int regno;
 
     if (node->ty == ND_NUM) {
         int registerNo = regno++;
         add(IR_IMM, registerNo, node->val);
         return registerNo;
+    }
+
+    if (node->ty == ND_IDENT) {
+        int r = gen_lval(node);
+        add(IR_LOAD, r, r);
+        return r;
+    }
+
+    if (node->ty == '=') {
+        int rhs = gen_expr(node->rhs);
+        int lhs = gen_lval(node->lhs);
+        add(IR_STORE, lhs, rhs);
+        add(IR_KILL, rhs, -1);
+        return lhs;
     }
 
     assert(strchr("+-*/", node->ty));
@@ -303,10 +386,10 @@ int gen_expr(Node *node) {
     int lhs = gen_expr(node->lhs);
     int rhs = gen_expr(node->rhs);
 
-    // 根据左右结果，生成当前+或-对应的TAC指令，将指令添加到指令序列末尾，那么将来结果放到哪个寄存器？继续往下看...
+    // 根据左右结果，生成当前"+-*/"对应的TAC指令，将指令添加到指令序列末尾，那么将来结果放到哪个寄存器？继续往下看...
     add(node->ty, lhs, rhs);
     // 生成特殊指令KILL，将右结果(操作数)占用的寄存器释放
-    add(IR_KILL, rhs, 0); // 准备好，将来执行TAC指令序列时，把右操作数占用的寄存器还回去
+    add(IR_KILL, rhs, -1); // 准备好，将来执行TAC指令序列时，把右操作数占用的寄存器还回去
     // 而将来的结果则放在左操作数之前占用的寄存器
     return lhs;
 }
@@ -314,14 +397,14 @@ int gen_expr(Node *node) {
 static void gen_stmt(Node *node) {
     if (node->ty == ND_RETURN) {
         int r = gen_expr(node->expr);
-        add(IR_RETURN, r, 0);
-        add(IR_KILL, r, 0);
+        add(IR_RETURN, r, -1);
+        add(IR_KILL, r, -1);
         return;
     }
 
     if (node->ty == ND_EXPR_STMT) {
         int r = gen_expr(node->expr);
-        add(IR_KILL, r, 0);
+        add(IR_KILL, r, -1);
         return;
     }
 
@@ -336,24 +419,35 @@ static void gen_stmt(Node *node) {
 
 Vector *gen_ir(Node *node) {
     assert(node->ty == ND_COMP_STMT);
+
     code = new_vec();
+    regno = 1;
+    basereg = 0;
+    vars = new_map();
+    bpoff = 0;
+
+    IR *alloca = add(IR_ALLOCA, basereg, -1);
     gen_stmt(node);
+    alloca->rhs = bpoff;
+    add(IR_KILL, basereg, -1);
     return code;
 }
 
-// Register allocator
+//// Register allocator
 char *regs[] = {"%rdi", "%rsi", "%r10", "%r11", "%r12", "%r13", "%r14", "%r15"};
 bool used[8];
 
 int *reg_map;
 
-int alloc(int ir_reg) {
+int alloc(int ir_reg) {  // 每个ir_reg都是一个地址，现在为其分配实际的寄存器
+    // 1. 若已经分配实际寄存器
     if (reg_map[ir_reg] != -1) {
         int registerNo = reg_map[ir_reg];
         assert(used[registerNo]);
         return registerNo;
     }
 
+    // 2. 若尚未分配实际寄存器
     for (int i = 0; i < sizeof(regs) / sizeof(*regs); i++) {
         if (used[i])
             continue;
@@ -371,27 +465,30 @@ void kill(int registerNo) {
 }
 
 void alloc_regs(Vector *irv) {
+    // 每条TAC指令都有一个result，都需要为其分配一个实际的寄存器，故总共分配这么大的空间
     reg_map = malloc(sizeof(int) * irv->len);
+    // 初始化分配表
     for (int i = 0; i < irv->len; i++)
         reg_map[i] = -1;
-
+    // 为每一条TAC指令分配给一个实际寄存器
     for (int i = 0; i < irv->len; i++) {
         IR *ir = irv->data[i];
 
         switch (ir->op) {
             case IR_IMM:
+            case IR_ALLOCA:
+            case IR_RETURN:
                 ir->lhs = alloc(ir->lhs);
                 break;
             case IR_MOV:
+            case IR_LOAD:
+            case IR_STORE:
             case '+':
             case '-':
             case '*':
             case '/':
                 ir->lhs = alloc(ir->lhs);
                 ir->rhs = alloc(ir->rhs);
-                break;
-            case IR_RETURN:
-                ir->lhs = alloc(ir->lhs);
                 break;
             case IR_KILL:
                 kill(reg_map[ir->lhs]);
@@ -403,9 +500,20 @@ void alloc_regs(Vector *irv) {
     }
 }
 
+//// Code generator
+static char *gen_label() {
+    static int n;
+    char buf[10];
+    sprintf(buf, ".L%d", n++);
+    return strdup(buf);
+}
 
-// Code generator
 void gen_x86(Vector *irv) {
+    char *ret_label = gen_label();
+
+    printf("  push %%rbp\n");
+    printf("  mov %%rsp, %%rbp\n");
+
     for (int i = 0; i < irv->len; i++) {
         IR *ir = irv->data[i];
 
@@ -418,7 +526,18 @@ void gen_x86(Vector *irv) {
                 break;
             case IR_RETURN:
                 printf("  mov %s, %%rax\n", regs[ir->lhs]);
-                printf("  ret\n");
+                printf("  jmp %s\n", ret_label);
+                break;
+            case IR_ALLOCA:
+                if (ir->rhs)
+                    printf("  sub $%d, %%rsp\n", ir->rhs);
+                printf("  mov %%rsp, %s\n", regs[ir->lhs]);
+                break;
+            case IR_LOAD:
+                printf("  mov (%s), %s\n", regs[ir->rhs], regs[ir->lhs]);
+                break;
+            case IR_STORE:
+                printf("  mov %s, (%s)\n", regs[ir->rhs], regs[ir->lhs]);
                 break;
             case '+':
                 printf("  add %s, %s\n", regs[ir->rhs], regs[ir->lhs]);
@@ -441,10 +560,15 @@ void gen_x86(Vector *irv) {
                 assert(0 && "unknown operator");
         }
     }
+
+    printf("%s:\n", ret_label);
+    printf("  mov %%rbp, %%rsp\n");
+    printf("  pop %%rbp\n");
+    printf("  ret\n");
 }
 
 
-// driver
+//// driver
 int main(int argc, char **argv) {
     if (argc != 2) {
         fprintf(stderr, "Usage: leon9cc <code>\n");
