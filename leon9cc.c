@@ -319,6 +319,9 @@ typedef struct {
     int op;
     int lhs;
     int rhs;
+
+    bool has_imm;
+    int imm;
 } IR;
 
 static Vector *code;
@@ -329,10 +332,20 @@ static Map *vars;
 static int bpoff;
 
 IR *add(int op, int lhs, int rhs) {
-    IR *ir = malloc(sizeof(IR));
+    IR *ir = calloc(1, sizeof(IR));
     ir->op = op;
     ir->lhs = lhs;
     ir->rhs = rhs;
+    vec_push(code, ir);
+    return ir;
+}
+
+static IR *add_imm(int op, int lhs, int imm) {
+    IR *ir = calloc(1, sizeof(IR));
+    ir->op = op;
+    ir->lhs = lhs;
+    ir->has_imm = true;
+    ir->imm = imm;
     vec_push(code, ir);
     return ir;
 }
@@ -346,15 +359,11 @@ static int gen_lval(Node *node) {
         bpoff += 8;
     }
     // 针对该变量（不管新旧）：
-    int r1 = regno++;    // 准备空间r1，用于存储basereg的值
+    int r = regno++;    // 准备空间r，用于存储basereg的值
     int off = (intptr_t)map_get(vars, node->name); // 获取该变量的偏移量
-    add(IR_MOV, r1, basereg); // 将basereg的值拷贝到r1
-
-    int r2 = regno++;      // 准备空间r2，用于存储偏移量off
-    add(IR_IMM, r2, off);  // 将偏移量off赋给r2
-    add('+', r1, r2);      // basereg + off
-    add(IR_KILL, r2, -1);  // 清空r2
-    return r1;             // 返回变量的存储地址
+    add(IR_MOV, r, basereg); // 将basereg的值拷贝到r
+    add_imm('+', r, off);    // basereg + off
+    return r;                // 返回变量的存储地址
 }
 
 int gen_expr(Node *node) {
@@ -488,7 +497,8 @@ void alloc_regs(Vector *irv) {
             case '*':
             case '/':
                 ir->lhs = alloc(ir->lhs);
-                ir->rhs = alloc(ir->rhs);
+                if (!ir->has_imm)
+                    ir->rhs = alloc(ir->rhs);
                 break;
             case IR_KILL:
                 kill(reg_map[ir->lhs]);
@@ -540,7 +550,10 @@ void gen_x86(Vector *irv) {
                 printf("  mov %s, (%s)\n", regs[ir->rhs], regs[ir->lhs]);
                 break;
             case '+':
-                printf("  add %s, %s\n", regs[ir->rhs], regs[ir->lhs]);
+                if (ir->has_imm)
+                    printf("  add $%d, %s\n", ir->imm, regs[ir->lhs]);
+                else
+                    printf("  add %s, %s\n", regs[ir->rhs], regs[ir->lhs]);
                 break;
             case '-':
                 printf("  sub %s, %s\n", regs[ir->rhs], regs[ir->lhs]);
