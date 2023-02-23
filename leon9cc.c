@@ -110,7 +110,7 @@ static Vector *scan(char *p) {
         }
 
         // Single-letter token
-        if (strchr("+-*/;=", *p)) {
+        if (strchr("+-*/;=()", *p)) {
             add_token(v, *p, p);
             i++;
             p++;
@@ -203,10 +203,19 @@ static Node *new_node(int op, Node *lhs, Node *rhs) {
     return node;
 }
 
-// term := num_literal | ident
+// term := num_literal | ident | "(" assign ")"
+static Node *assign();
+
 static Node *term() {
-    Node *node = malloc(sizeof(Node));
     Token *t = tokens->data[pos++];
+
+    if (t->ty == '(') {
+        Node *node = assign();
+        expect(')');
+        return node;
+    }
+
+    Node *node = malloc(sizeof(Node));
 
     if (t->ty == TK_NUM) {
         node->ty = ND_NUM;
@@ -293,7 +302,7 @@ static Node *stmt() {
  * assign :=  expr ("=" expr)?
  * expr = mul_div ("+" mul_div | "-" mul_div)*
  * mul_div :=  term ("*" term | "/" term)*
- * term := num_literal | ident
+ * term := num_literal | ident | "(" assign ")"
  *
  *********************************************************/
 Node *parse(Vector *v) {
